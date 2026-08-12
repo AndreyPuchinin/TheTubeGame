@@ -1,0 +1,1790 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Double Tunnel Continuous + Records</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #05070a;
+      display: grid;
+      place-items: center;
+      font-family: monospace;
+    }
+
+    canvas {
+      background: #04060a;
+      box-shadow: 0 0 40px rgba(0, 0, 0, 0.8);
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="960" height="640"></canvas>
+
+<script>
+'use strict';
+
+const W = 960;
+const H = 640;
+
+// Размеры одной ячейки туннеля.
+const CELL_W = 130;
+const CELL_H = 100;
+
+// Толщина стены.
+const WALL = 16;
+
+// Ширина прохода между соседними ячейками.
+const OPEN = 46;
+
+// Скорость.
+const DEFAULT_SPEED = 150;
+const MIN_SPEED = 50;
+const MAX_SPEED = 400;
+const SPEED_STEP = 10;
+
+// Генерация.
+const INITIAL_FORWARD = 6;
+const INITIAL_BACK = 2;
+
+const AHEAD_MIN = 3;
+const EXTEND_BATCH = 3;
+
+const KEEP_BEHIND = 3;
+const MAX_ACTIVE = 120;
+
+// Рекорды.
+const MAX_RECORDS = 10;
+
+const RECORDS_KEY = 'double_tunnel_continuous_records_v2';
+const LAST_NAME_KEY = 'double_tunnel_last_name_v2';
+const SPEEDS_KEY = 'double_tunnel_speeds_v2';
+
+const DIRS = {
+  up:    { x: 0, y: -1 },
+  down:  { x: 0, y:  1 },
+  left:  { x: -1, y: 0 },
+  right: { x: 1, y: 0 }
+};
+
+const KEYMAP = {
+  KeyW: [0, 'up'],
+  KeyA: [0, 'left'],
+  KeyS: [0, 'down'],
+  KeyD: [0, 'right'],
+
+  ArrowUp:    [1, 'up'],
+  ArrowLeft:  [1, 'left'],
+  ArrowDown:  [1, 'down'],
+  ArrowRight: [1, 'right']
+};
+
+const PREVENT_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'Space'
+]);
+
+function key(x, y) {
+  return `${x},${y}`;
+}
+
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function randomDirs() {
+  return shuffle([
+    { x: 0, y: -1 },
+    { x: 0, y: 1 },
+    { x: -1, y: 0 },
+    { x: 1, y: 0 }
+  ]);
+}
+
+function clampSpeed(v) {
+  return Math.max(MIN_SPEED, Math.min(MAX_SPEED, Math.round(v)));
+}
+
+// Достойная формула рекордного рейтинга.
+// Чем выше скорость, тем ценнее очки.
+// Но если один туннель сильно медленнее, это понижает рекорд.
+function calcRecordRating(score, speed1, speed2) {
+  const s = Number(score) || 0;
+  const v1 = clampSpeed(Number(speed1) || DEFAULT_SPEED);
+  const v2 = clampSpeed(Number(speed2) || DEFAULT_SPEED);
+
+  if (s <= 0) return 0;
+
+  const vmax = Math.max(v1, v2);
+  const vmin = Math.min(v1, v2);
+
+  const effectiveSpeed = 0.75 * vmax + 0.25 * vmin;
+
+  return Math.round(s * effectiveSpeed / DEFAULT_SPEED);
+}
+
+function normalizeRecord(r) {
+  const score = Number(r?.score) || 0;
+  const speed1 = clampSpeed(Number(r?.speed1) || DEFAULT_SPEED);
+  const speed2 = clampSpeed(Number(r?.speed2) || DEFAULT_SPEED);
+
+  const rating = Number(r?.rating) > 0
+    ? Number(r.rating)
+    : calcRecordRating(score, speed1, speed2);
+
+  return {
+    name: String(r?.name || 'PLAYER').slice(0, 14),
+    score,
+    p1: Number(r?.p1) || 0,
+    p2: Number(r?.p2) || 0,
+    speed1,
+    speed2,
+    rating,
+    date: r?.date || new Date().toISOString()
+  };
+}
+
+function loadSpeeds() {
+  try {
+    const raw = localStorage.getItem(SPEEDS_KEY);
+    const obj = JSON.parse(raw);
+
+    if (!obj) {
+      return { s1: DEFAULT_SPEED, s2: DEFAULT_SPEED };
+    }
+
+    return {
+      s1: clampSpeed(obj.s1 ?? DEFAULT_SPEED),
+      s2: clampSpeed(obj.s2 ?? DEFAULT_SPEED)
+    };
+  } catch (e) {
+    return { s1: DEFAULT_SPEED, s2: DEFAULT_SPEED };
+  }
+}
+
+function storeSpeeds(s1, s2) {
+  try {
+    localStorage.setItem(SPEEDS_KEY, JSON.stringify({ s1, s2 }));
+  } catch (e) {
+    // ignore
+  }
+}
+
+function loadRecords() {
+  try {
+    const raw = localStorage.getItem(RECORDS_KEY);
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function storeRecords(records) {
+  try {
+    localStorage.setItem(RECORDS_KEY, JSON.stringify(records));
+  } catch (e) {
+    // ignore
+  }
+}
+
+function loadLastName() {
+  try {
+    return localStorage.getItem(LAST_NAME_KEY) || 'PLAYER';
+  } catch (e) {
+    return 'PLAYER';
+  }
+}
+
+function storeLastName(name) {
+  try {
+    localStorage.setItem(LAST_NAME_KEY, name);
+  } catch (e) {
+    // ignore
+  }
+}
+
+function speedLabelFromRecord(r) {
+  const s1 = r.speed1 ?? DEFAULT_SPEED;
+  const s2 = r.speed2 ?? DEFAULT_SPEED;
+
+  if (s1 === s2) {
+    return `${s1}`;
+  }
+
+  return `${s1}/${s2}`;
+}
+
+class Tunnel {
+  constructor(color, label) {
+    this.color = color;
+    this.label = label;
+    this.reset();
+  }
+
+  reset() {
+    this.progress = 0;
+    this.alive = true;
+    this.buildInitial({ gx: 0, gy: 0 }, false);
+  }
+
+  headAbs() {
+    return this.tailIndex + this.path.length - 1;
+  }
+
+  addCell(gx, gy) {
+    const idx = this.tailIndex + this.path.length;
+    this.path.push({ gx, gy });
+    this.cellMap.set(key(gx, gy), idx);
+    return idx;
+  }
+
+  removeTail() {
+    if (this.path.length <= 1) return;
+
+    const c = this.path.shift();
+    this.cellMap.delete(key(c.gx, c.gy));
+    this.tailIndex++;
+  }
+
+  cellCenter(gx, gy) {
+    return {
+      x: gx * CELL_W + CELL_W / 2,
+      y: gy * CELL_H + CELL_H / 2
+    };
+  }
+
+  cellInterior(gx, gy) {
+    return {
+      x: gx * CELL_W + WALL,
+      y: gy * CELL_H + WALL,
+      w: CELL_W - WALL * 2,
+      h: CELL_H - WALL * 2
+    };
+  }
+
+  passageRect(a, b) {
+    const dx = b.gx - a.gx;
+    const dy = b.gy - a.gy;
+
+    if (Math.abs(dx) === 1 && dy === 0) {
+      const minX = Math.min(a.gx, b.gx);
+
+      return {
+        x: minX * CELL_W + CELL_W - WALL,
+        y: a.gy * CELL_H + CELL_H / 2 - OPEN / 2,
+        w: WALL * 2,
+        h: OPEN
+      };
+    }
+
+    if (dx === 0 && Math.abs(dy) === 1) {
+      const minY = Math.min(a.gy, b.gy);
+
+      return {
+        x: a.gx * CELL_W + CELL_W / 2 - OPEN / 2,
+        y: minY * CELL_H + CELL_H - WALL,
+        w: OPEN,
+        h: WALL * 2
+      };
+    }
+
+    return null;
+  }
+
+  pointInRect(x, y, r) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  }
+
+  queryPoint(x, y) {
+    // Сначала проверяем интерьеры ячеек.
+    for (let i = 0; i < this.path.length; i++) {
+      const c = this.path[i];
+      const r = this.cellInterior(c.gx, c.gy);
+
+      if (this.pointInRect(x, y, r)) {
+        return {
+          inside: true,
+          cellAbs: this.tailIndex + i
+        };
+      }
+    }
+
+    // Затем проверяем проходы между соседними ячейками.
+    for (let i = 0; i < this.path.length - 1; i++) {
+      const r = this.passageRect(this.path[i], this.path[i + 1]);
+
+      if (r && this.pointInRect(x, y, r)) {
+        return {
+          inside: true,
+          cellAbs: null
+        };
+      }
+    }
+
+    return {
+      inside: false,
+      cellAbs: null
+    };
+  }
+
+  canPlaceStatic(gx, gy, pgx, pgy, occupied) {
+    const k = key(gx, gy);
+    if (occupied.has(k)) return false;
+
+    const prevKey = key(pgx, pgy);
+
+    const neighbors = [
+      { x: gx + 1, y: gy },
+      { x: gx - 1, y: gy },
+      { x: gx, y: gy + 1 },
+      { x: gx, y: gy - 1 }
+    ];
+
+    for (const n of neighbors) {
+      const nk = key(n.x, n.y);
+
+      if (occupied.has(nk) && nk !== prevKey) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  genChain(sx, sy, steps, occupied, chain, center, boundX, boundY) {
+    let cx = sx;
+    let cy = sy;
+
+    for (let i = 0; i < steps; i++) {
+      let placed = false;
+
+      for (const d of randomDirs()) {
+        const nx = cx + d.x;
+        const ny = cy + d.y;
+
+        if (
+          Math.abs(nx - center.gx) > boundX ||
+          Math.abs(ny - center.gy) > boundY
+        ) {
+          continue;
+        }
+
+        if (this.canPlaceStatic(nx, ny, cx, cy, occupied)) {
+          occupied.add(key(nx, ny));
+          chain.push({ gx: nx, gy: ny });
+          cx = nx;
+          cy = ny;
+          placed = true;
+          break;
+        }
+      }
+
+      if (!placed) return false;
+    }
+
+    return true;
+  }
+
+  tryBuildRandom(center) {
+    const boundX = 4;
+    const boundY = 3;
+
+    const occupied = new Set([key(center.gx, center.gy)]);
+
+    const forward = [{ gx: center.gx, gy: center.gy }];
+    if (!this.genChain(
+      center.gx,
+      center.gy,
+      INITIAL_FORWARD,
+      occupied,
+      forward,
+      center,
+      boundX,
+      boundY
+    )) {
+      return false;
+    }
+
+    const backward = [{ gx: center.gx, gy: center.gy }];
+    if (!this.genChain(
+      center.gx,
+      center.gy,
+      INITIAL_BACK,
+      occupied,
+      backward,
+      center,
+      boundX,
+      boundY
+    )) {
+      return false;
+    }
+
+    const cells = [
+      ...backward.slice(1).reverse(),
+      ...forward
+    ];
+
+    this.path = [];
+    this.cellMap = new Map();
+    this.tailIndex = 0;
+
+    for (const c of cells) {
+      this.addCell(c.gx, c.gy);
+    }
+
+    this.currentAbs = INITIAL_BACK;
+    this.pos = this.cellCenter(center.gx, center.gy);
+    this.updateDirFromPath();
+
+    return true;
+  }
+
+  buildFallback(center, savedProgress) {
+    this.path = [];
+    this.cellMap = new Map();
+    this.tailIndex = 0;
+
+    const back = INITIAL_BACK;
+    const forward = Math.max(4, AHEAD_MIN + 1);
+
+    for (let i = -back; i <= forward; i++) {
+      this.addCell(center.gx + i, center.gy);
+    }
+
+    this.currentAbs = back;
+    this.pos = this.cellCenter(center.gx, center.gy);
+    this.updateDirFromPath();
+
+    this.progress = savedProgress;
+    this.alive = true;
+  }
+
+  buildInitial(center, keepProgress) {
+    const saved = keepProgress ? this.progress : 0;
+
+    this.path = [];
+    this.cellMap = new Map();
+    this.tailIndex = 0;
+    this.currentAbs = 0;
+    this.pos = this.cellCenter(center.gx, center.gy);
+    this.dir = { x: 1, y: 0 };
+    this.alive = true;
+
+    for (let attempt = 0; attempt < 80; attempt++) {
+      if (this.tryBuildRandom(center)) {
+        this.progress = saved;
+        return;
+      }
+    }
+
+    this.buildFallback(center, saved);
+  }
+
+  getCurrentCell() {
+    const i = this.currentAbs - this.tailIndex;
+
+    if (i >= 0 && i < this.path.length) {
+      return this.path[i];
+    }
+
+    return null;
+  }
+
+  updateDirFromPath() {
+    const i = this.currentAbs - this.tailIndex;
+    const cur = this.path[i];
+    const next = this.path[i + 1];
+
+    if (cur && next) {
+      const dx = next.gx - cur.gx;
+      const dy = next.gy - cur.gy;
+      const len = Math.hypot(dx, dy) || 1;
+
+      this.dir = {
+        x: dx / len,
+        y: dy / len
+      };
+    } else {
+      this.dir = { x: 1, y: 0 };
+    }
+  }
+
+  canPlaceMacro(gx, gy, pgx, pgy) {
+    const k = key(gx, gy);
+    if (this.cellMap.has(k)) return false;
+
+    const prevKey = key(pgx, pgy);
+
+    const neighbors = [
+      { x: gx + 1, y: gy },
+      { x: gx - 1, y: gy },
+      { x: gx, y: gy + 1 },
+      { x: gx, y: gy - 1 }
+    ];
+
+    for (const n of neighbors) {
+      const nk = key(n.x, n.y);
+
+      if (this.cellMap.has(nk) && nk !== prevKey) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  dfs(depth, gx, gy) {
+    if (depth <= 0) return true;
+
+    for (const d of randomDirs()) {
+      const nx = gx + d.x;
+      const ny = gy + d.y;
+
+      if (this.canPlaceMacro(nx, ny, gx, gy)) {
+        this.addCell(nx, ny);
+
+        if (this.dfs(depth - 1, nx, ny)) {
+          return true;
+        }
+
+        this.path.pop();
+        this.cellMap.delete(key(nx, ny));
+      }
+    }
+
+    return false;
+  }
+
+  extendDfs(depth) {
+    if (depth <= 0) return true;
+    if (!this.path.length) return false;
+
+    const head = this.path[this.path.length - 1];
+    return this.dfs(depth, head.gx, head.gy);
+  }
+
+  extendAhead() {
+    if (!this.path.length) return;
+
+    const ahead = this.headAbs() - this.currentAbs;
+    if (ahead >= AHEAD_MIN) return;
+
+    this.cleanup();
+
+    const need = Math.min(EXTEND_BATCH, AHEAD_MIN - ahead + 2);
+
+    if (this.extendDfs(need)) return;
+
+    for (let n = Math.min(need, 2); n >= 1; n--) {
+      if (this.extendDfs(n)) return;
+    }
+
+    let tries = 0;
+
+    while (
+      this.path.length > 4 &&
+      this.tailIndex < this.currentAbs - 1 &&
+      tries < 30
+    ) {
+      this.removeTail();
+      tries++;
+
+      if (this.extendDfs(1)) return;
+    }
+
+    const cur = this.getCurrentCell() || {
+      gx: Math.floor(this.pos.x / CELL_W),
+      gy: Math.floor(this.pos.y / CELL_H)
+    };
+
+    // Аварийная перестройка вокруг текущей ячейки.
+    this.buildInitial({ gx: cur.gx, gy: cur.gy }, true);
+  }
+
+  cleanup() {
+    const margin = 80;
+
+    while (this.path.length > 1) {
+      const abs = this.tailIndex;
+
+      // Не удаляем слишком близко к текущей ячейке.
+      if (abs >= this.currentAbs - KEEP_BEHIND) break;
+
+      const c = this.path[0];
+
+      const rx = c.gx * CELL_W;
+      const ry = c.gy * CELL_H;
+
+      const sx = rx - this.pos.x + W / 2;
+      const sy = ry - this.pos.y + H / 2;
+
+      const offScreen =
+        sx + CELL_W < -margin ||
+        sx > W + margin ||
+        sy + CELL_H < -margin ||
+        sy > H + margin;
+
+      if (offScreen || this.path.length > MAX_ACTIVE) {
+        this.removeTail();
+      } else {
+        break;
+      }
+    }
+  }
+
+  enterCell(abs) {
+    if (abs === this.currentAbs) return;
+
+    if (abs === this.currentAbs + 1) {
+      this.progress++;
+      this.currentAbs = abs;
+    } else if (abs === this.currentAbs - 1) {
+      this.progress--;
+      this.currentAbs = abs;
+    } else {
+      this.alive = false;
+      return;
+    }
+
+    this.cleanup();
+    this.extendAhead();
+  }
+
+  update(dt, speed) {
+    if (!this.alive || !this.dir) return;
+
+    let remaining = (speed || DEFAULT_SPEED) * dt;
+
+    // Небольшой substep, чтобы точка не проскакивала стены.
+    const maxStep = 3;
+
+    while (remaining > 0.0001 && this.alive) {
+      const step = Math.min(maxStep, remaining);
+      remaining -= step;
+
+      const nx = this.pos.x + this.dir.x * step;
+      const ny = this.pos.y + this.dir.y * step;
+
+      const q = this.queryPoint(nx, ny);
+
+      if (!q.inside) {
+        this.alive = false;
+        break;
+      }
+
+      this.pos.x = nx;
+      this.pos.y = ny;
+
+      if (q.cellAbs !== null && q.cellAbs !== this.currentAbs) {
+        this.enterCell(q.cellAbs);
+      }
+    }
+  }
+}
+
+class StateMachine {
+  constructor(owner) {
+    this.owner = owner;
+    this.states = {};
+    this.current = null;
+  }
+
+  add(name, state) {
+    this.states[name] = state;
+  }
+
+  set(name) {
+    const next = this.states[name];
+    if (!next) return;
+
+    if (this.current && this.current.exit) {
+      this.current.exit(this.owner);
+    }
+
+    this.current = next;
+
+    if (this.current.enter) {
+      this.current.enter(this.owner);
+    }
+  }
+
+  update(dt) {
+    if (this.current && this.current.update) {
+      this.current.update(this.owner, dt);
+    }
+  }
+
+  render(ctx) {
+    if (this.current && this.current.render) {
+      this.current.render(this.owner, ctx);
+    }
+  }
+
+  handleKey(e, down) {
+    if (this.current && this.current.handleKey) {
+      this.current.handleKey(this.owner, e, down);
+    }
+  }
+}
+
+class Game {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+
+    this.time = 0;
+    this.last = performance.now();
+
+    this.tunnels = [];
+    this.score = 0;
+    this.finalScore = 0;
+
+    this.held = [[], []];
+
+    const speeds = loadSpeeds();
+    this.speed1 = speeds.s1;
+    this.speed2 = speeds.s2;
+    this.runSpeeds = [this.speed1, this.speed2];
+
+    this.records = loadRecords()
+      .map(normalizeRecord)
+      .sort((a, b) => b.rating - a.rating)
+      .slice(0, MAX_RECORDS);
+
+    this.menuItems = ['start', 'speedAll', 'speed1', 'speed2', 'records'];
+    this.menuIndex = 0;
+
+    this.pauseItems = ['resume', 'restart', 'saveexit', 'exit'];
+    this.pauseIndex = 0;
+
+    this.gameoverItems = ['restart', 'save', 'menu'];
+    this.gameoverIndex = 0;
+
+    this.pendingRecord = null;
+    this.pendingQualifies = false;
+    this.nameBuffer = loadLastName();
+
+    this.fsm = new StateMachine(this);
+    this.setupStates();
+    this.fsm.set('menu');
+
+    window.addEventListener('keydown', (e) => {
+      if (PREVENT_KEYS.has(e.code)) {
+        e.preventDefault();
+      }
+
+      this.fsm.handleKey(e, true);
+    });
+
+    window.addEventListener('keyup', (e) => {
+      this.fsm.handleKey(e, false);
+    });
+
+    this.loop = this.loop.bind(this);
+    requestAnimationFrame(this.loop);
+  }
+
+  setupStates() {
+    this.fsm.add('menu', {
+      enter: (g) => {
+        g.resetInput();
+        g.menuIndex = 0;
+      },
+
+      render: (g, ctx) => {
+        g.renderMenu(ctx);
+      },
+
+      handleKey: (g, e, down) => {
+        g.handleMenuKey(e, down);
+      }
+    });
+
+    this.fsm.add('play', {
+      enter: (g) => {
+        g.resetInput();
+      },
+
+      update: (g, dt) => {
+        g.updatePlay(dt);
+      },
+
+      render: (g, ctx) => {
+        g.renderPlay(ctx);
+      },
+
+      handleKey: (g, e, down) => {
+        g.handlePlayKey(e, down);
+      }
+    });
+
+    this.fsm.add('pause', {
+      enter: (g) => {
+        g.resetInput();
+        g.pauseIndex = 0;
+      },
+
+      render: (g, ctx) => {
+        g.renderPlay(ctx);
+        g.renderPause(ctx);
+      },
+
+      handleKey: (g, e, down) => {
+        g.handlePauseKey(e, down);
+      }
+    });
+
+    this.fsm.add('gameover', {
+      enter: (g) => {
+        g.resetInput();
+        g.gameoverIndex = 0;
+      },
+
+      render: (g, ctx) => {
+        g.renderGameOver(ctx);
+      },
+
+      handleKey: (g, e, down) => {
+        g.handleGameoverKey(e, down);
+      }
+    });
+
+    this.fsm.add('records', {
+      enter: (g) => {
+        g.resetInput();
+      },
+
+      render: (g, ctx) => {
+        g.renderRecords(ctx);
+      },
+
+      handleKey: (g, e, down) => {
+        g.handleRecordsKey(e, down);
+      }
+    });
+
+    this.fsm.add('name', {
+      enter: (g) => {
+        g.resetInput();
+
+        if (!g.pendingRecord || !g.pendingQualifies) {
+          g.fsm.set('menu');
+          return;
+        }
+
+        g.nameBuffer = loadLastName();
+      },
+
+      render: (g, ctx) => {
+        g.renderNameEntry(ctx);
+      },
+
+      handleKey: (g, e, down) => {
+        g.handleNameKey(e, down);
+      }
+    });
+  }
+
+  startGame() {
+    this.runSpeeds = [this.speed1, this.speed2];
+
+    this.tunnels = [
+      new Tunnel('#38c9ff', 'WASD'),
+      new Tunnel('#ff5ad1', 'ARROWS')
+    ];
+
+    this.score = 0;
+    this.finalScore = 0;
+    this.pendingRecord = null;
+    this.pendingQualifies = false;
+
+    this.resetInput();
+    this.fsm.set('play');
+  }
+
+  resetInput() {
+    this.held = [[], []];
+  }
+
+  press(tunnelIndex, dir) {
+    if (!this.held[tunnelIndex].includes(dir)) {
+      this.held[tunnelIndex].push(dir);
+    }
+  }
+
+  release(tunnelIndex, dir) {
+    this.held[tunnelIndex] = this.held[tunnelIndex].filter(d => d !== dir);
+  }
+
+  inputVector(tunnelIndex) {
+    let x = 0;
+    let y = 0;
+
+    for (const dirName of this.held[tunnelIndex]) {
+      const d = DIRS[dirName];
+      x += d.x;
+      y += d.y;
+    }
+
+    if (x === 0 && y === 0) {
+      return null;
+    }
+
+    const len = Math.hypot(x, y) || 1;
+
+    return {
+      x: x / len,
+      y: y / len
+    };
+  }
+
+  calcScore() {
+    if (!this.tunnels.length) return 0;
+
+    const a = Math.max(0, this.tunnels[0].progress);
+    const b = Math.max(0, this.tunnels[1].progress);
+
+    const min = Math.min(a, b);
+    const max = Math.max(a, b);
+
+    return Math.round(10 * (1.75 * min + 0.25 * max));
+  }
+
+  makePendingRecord(score, p1, p2) {
+    if (!score || score <= 0) return null;
+
+    const speed1 = this.runSpeeds ? this.runSpeeds[0] : this.speed1;
+    const speed2 = this.runSpeeds ? this.runSpeeds[1] : this.speed2;
+
+    const rating = calcRecordRating(score, speed1, speed2);
+
+    if (!rating || rating <= 0) return null;
+
+    return {
+      score: Math.round(score),
+      p1,
+      p2,
+      speed1,
+      speed2,
+      rating,
+      date: new Date().toISOString()
+    };
+  }
+
+  wouldEntryQualify(entry) {
+    if (!entry || !entry.rating || entry.rating <= 0) {
+      return false;
+    }
+
+    // Если уже есть рекорд с точно такой же скоростью и не меньшим rating,
+    // то этот результат не круче по очкам при той же скорости.
+    const blockedBySameSpeed = this.records.some((r) => {
+      return (
+        r.speed1 === entry.speed1 &&
+        r.speed2 === entry.speed2 &&
+        r.rating >= entry.rating
+      );
+    });
+
+    if (blockedBySameSpeed) {
+      return false;
+    }
+
+    // Пока таблица не заполнена, любой положительный rating может попасть.
+    if (this.records.length < MAX_RECORDS) {
+      return true;
+    }
+
+    // Дальше пускаем только если результат сильнее худшего рекорда в топ-10.
+    const worst = this.records[this.records.length - 1];
+    return entry.rating > worst.rating;
+  }
+
+  getCurrentPendingPreview() {
+    if (!this.tunnels.length) return null;
+
+    const p1 = this.tunnels[0].progress;
+    const p2 = this.tunnels[1].progress;
+
+    return this.makePendingRecord(this.calcScore(), p1, p2);
+  }
+
+  currentResultQualifies() {
+    return this.wouldEntryQualify(this.getCurrentPendingPreview());
+  }
+
+  preparePendingFromCurrent() {
+    this.pendingRecord = this.getCurrentPendingPreview();
+    this.pendingQualifies = this.wouldEntryQualify(this.pendingRecord);
+  }
+
+  enterGameOver() {
+    this.finalScore = this.calcScore();
+
+    const p1 = this.tunnels.length ? this.tunnels[0].progress : 0;
+    const p2 = this.tunnels.length ? this.tunnels[1].progress : 0;
+
+    this.pendingRecord = this.makePendingRecord(this.finalScore, p1, p2);
+    this.pendingQualifies = this.wouldEntryQualify(this.pendingRecord);
+
+    this.fsm.set('gameover');
+  }
+
+  savePendingRecord() {
+    if (!this.pendingRecord || !this.pendingQualifies) {
+      this.fsm.set('menu');
+      return;
+    }
+
+    const name = this.nameBuffer.trim() || 'PLAYER';
+    storeLastName(name);
+
+    const entry = normalizeRecord(
+      Object.assign({}, this.pendingRecord, { name })
+    );
+
+    this.records.push(entry);
+    this.records.sort((a, b) => b.rating - a.rating);
+    this.records = this.records.slice(0, MAX_RECORDS);
+
+    storeRecords(this.records);
+
+    this.pendingRecord = null;
+    this.pendingQualifies = false;
+
+    this.fsm.set('records');
+  }
+
+  adjustSpeed(itemId, delta) {
+    if (itemId === 'speedAll') {
+      const base = this.speed1 === this.speed2
+        ? this.speed1
+        : Math.round((this.speed1 + this.speed2) / 2);
+
+      const v = clampSpeed(base + delta);
+      this.speed1 = v;
+      this.speed2 = v;
+    } else if (itemId === 'speed1') {
+      this.speed1 = clampSpeed(this.speed1 + delta);
+    } else if (itemId === 'speed2') {
+      this.speed2 = clampSpeed(this.speed2 + delta);
+    } else {
+      return;
+    }
+
+    storeSpeeds(this.speed1, this.speed2);
+  }
+
+  updatePlay(dt) {
+    const sec = Math.min(dt, 50) / 1000;
+
+    for (let i = 0; i < 2; i++) {
+      const v = this.inputVector(i);
+
+      if (v) {
+        this.tunnels[i].dir = v;
+      }
+
+      this.tunnels[i].update(sec, this.runSpeeds[i]);
+
+      if (!this.tunnels[i].alive) {
+        this.enterGameOver();
+        return;
+      }
+    }
+
+    if (!this.tunnels[0].alive || !this.tunnels[1].alive) {
+      this.enterGameOver();
+      return;
+    }
+
+    this.score = this.calcScore();
+  }
+
+  handlePlayKey(e, down) {
+    if (down && !e.repeat && e.code === 'Escape') {
+      this.fsm.set('pause');
+      return;
+    }
+
+    const mapped = KEYMAP[e.code];
+    if (!mapped) return;
+
+    const [tunnelIndex, dir] = mapped;
+
+    if (down) {
+      if (!e.repeat) {
+        this.press(tunnelIndex, dir);
+      }
+    } else {
+      this.release(tunnelIndex, dir);
+    }
+  }
+
+  handleMenuKey(e, down) {
+    if (!down) return;
+
+    if (e.code === 'ArrowUp') {
+      this.menuIndex = (this.menuIndex - 1 + this.menuItems.length) % this.menuItems.length;
+      return;
+    }
+
+    if (e.code === 'ArrowDown') {
+      this.menuIndex = (this.menuIndex + 1) % this.menuItems.length;
+      return;
+    }
+
+    const selected = this.menuItems[this.menuIndex];
+
+    if (e.code === 'ArrowLeft') {
+      this.adjustSpeed(selected, -SPEED_STEP);
+      return;
+    }
+
+    if (e.code === 'ArrowRight') {
+      this.adjustSpeed(selected, SPEED_STEP);
+      return;
+    }
+
+    if ((e.code === 'Enter' || e.code === 'Space') && !e.repeat) {
+      if (selected === 'start') {
+        this.startGame();
+      } else if (selected === 'records') {
+        this.fsm.set('records');
+      }
+    }
+  }
+
+  handlePauseKey(e, down) {
+    if (!down) return;
+
+    if (e.code === 'Escape' && !e.repeat) {
+      this.fsm.set('play');
+      return;
+    }
+
+    if (e.code === 'ArrowUp') {
+      this.pauseIndex = (this.pauseIndex - 1 + this.pauseItems.length) % this.pauseItems.length;
+      return;
+    }
+
+    if (e.code === 'ArrowDown') {
+      this.pauseIndex = (this.pauseIndex + 1) % this.pauseItems.length;
+      return;
+    }
+
+    if (e.code === 'Enter' && !e.repeat) {
+      const selected = this.pauseItems[this.pauseIndex];
+
+      if (selected === 'resume') {
+        this.fsm.set('play');
+      } else if (selected === 'restart') {
+        this.startGame();
+      } else if (selected === 'saveexit') {
+        this.preparePendingFromCurrent();
+
+        if (this.pendingRecord && this.pendingQualifies) {
+          this.fsm.set('name');
+        }
+      } else if (selected === 'exit') {
+        this.fsm.set('menu');
+      }
+    }
+  }
+
+  handleGameoverKey(e, down) {
+    if (!down) return;
+
+    if (e.code === 'ArrowUp') {
+      this.gameoverIndex = (this.gameoverIndex - 1 + this.gameoverItems.length) % this.gameoverItems.length;
+      return;
+    }
+
+    if (e.code === 'ArrowDown') {
+      this.gameoverIndex = (this.gameoverIndex + 1) % this.gameoverItems.length;
+      return;
+    }
+
+    if (e.code === 'Enter' && !e.repeat) {
+      const selected = this.gameoverItems[this.gameoverIndex];
+
+      if (selected === 'restart') {
+        this.startGame();
+      } else if (selected === 'save') {
+        if (this.pendingRecord && this.pendingQualifies) {
+          this.fsm.set('name');
+        }
+      } else if (selected === 'menu') {
+        this.fsm.set('menu');
+      }
+    }
+  }
+
+  handleRecordsKey(e, down) {
+    if (!down || e.repeat) return;
+
+    if (e.code === 'Enter' || e.code === 'Escape' || e.code === 'Space') {
+      this.fsm.set('menu');
+    }
+  }
+
+  handleNameKey(e, down) {
+    if (!down) return;
+
+    if (e.code === 'Enter' && !e.repeat) {
+      this.savePendingRecord();
+      return;
+    }
+
+    if (e.code === 'Escape' && !e.repeat) {
+      this.pendingRecord = null;
+      this.pendingQualifies = false;
+      this.fsm.set('menu');
+      return;
+    }
+
+    if (e.code === 'Backspace') {
+      e.preventDefault();
+
+      if (this.nameBuffer.length > 0) {
+        this.nameBuffer = this.nameBuffer.slice(0, -1);
+      }
+
+      return;
+    }
+
+    if (e.ctrlKey || e.metaKey || e.altKey) {
+      return;
+    }
+
+    if (typeof e.key === 'string' && e.key.length === 1) {
+      if (this.nameBuffer.length < 14) {
+        this.nameBuffer += e.key;
+      }
+    }
+  }
+
+  drawText(ctx, text, x, y, size = 16, color = '#fff', align = 'center') {
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.font = `${size}px monospace`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  }
+
+  renderMenu(ctx) {
+    ctx.fillStyle = '#04060a';
+    ctx.fillRect(0, 0, W, H);
+
+    this.drawText(ctx, 'DOUBLE TUNNEL', W / 2, 110, 52, '#66ddff');
+    this.drawText(ctx, 'records + speed formula', W / 2, 158, 18, '#7f93a8');
+
+    const speedAllLabel = this.speed1 === this.speed2
+      ? `${this.speed1}`
+      : `${this.speed1}/${this.speed2}`;
+
+    const labels = {
+      start: 'Старт',
+      speedAll: `Скорость обоих: ${speedAllLabel}`,
+      speed1: `Скорость T1: ${this.speed1}`,
+      speed2: `Скорость T2: ${this.speed2}`,
+      records: `Рекорды (${this.records.length}/${MAX_RECORDS})`
+    };
+
+    this.menuItems.forEach((id, i) => {
+      const selected = i === this.menuIndex;
+      const prefix = selected ? '> ' : '  ';
+      const color = selected ? '#ffffff' : '#8fa3b8';
+      const size = selected ? 27 : 22;
+
+      this.drawText(
+        ctx,
+        prefix + labels[id],
+        W / 2,
+        250 + i * 42,
+        size,
+        color
+      );
+    });
+
+    this.drawText(
+      ctx,
+      'Up/Down — выбор, Left/Right — скорость, Enter — подтвердить',
+      W / 2,
+      480,
+      16,
+      '#5d7184'
+    );
+
+    this.drawText(
+      ctx,
+      'Формула рекорда:',
+      W / 2,
+      520,
+      18,
+      '#7f93a8'
+    );
+
+    this.drawText(
+      ctx,
+      `Rating = Score × (0.75×Vmax + 0.25×Vmin) / ${DEFAULT_SPEED}`,
+      W / 2,
+      546,
+      18,
+      '#ffd76a'
+    );
+
+    this.drawText(
+      ctx,
+      'Vmax = максимальная скорость туннеля, Vmin = минимальная скорость туннеля',
+      W / 2,
+      572,
+      14,
+      '#445566'
+    );
+  }
+
+  renderTunnel(ctx, t) {
+    ctx.save();
+    ctx.globalAlpha = 0.42;
+    ctx.fillStyle = t.color;
+
+    // Интерьеры ячеек.
+    for (const c of t.path) {
+      const r = t.cellInterior(c.gx, c.gy);
+
+      const sx = W / 2 + (r.x - t.pos.x);
+      const sy = H / 2 + (r.y - t.pos.y);
+
+      if (sx + r.w < -50 || sx > W + 50 || sy + r.h < -50 || sy > H + 50) {
+        continue;
+      }
+
+      ctx.fillRect(sx, sy, r.w, r.h);
+    }
+
+    // Проходы между соседними ячейками.
+    for (let i = 0; i < t.path.length - 1; i++) {
+      const r = t.passageRect(t.path[i], t.path[i + 1]);
+      if (!r) continue;
+
+      const sx = W / 2 + (r.x - t.pos.x);
+      const sy = H / 2 + (r.y - t.pos.y);
+
+      if (sx + r.w < -50 || sx > W + 50 || sy + r.h < -50 || sy > H + 50) {
+        continue;
+      }
+
+      ctx.fillRect(sx, sy, r.w, r.h);
+    }
+
+    ctx.restore();
+
+    // Подсветка текущей ячейки.
+    const cur = t.getCurrentCell();
+
+    if (cur) {
+      const r = t.cellInterior(cur.gx, cur.gy);
+
+      const sx = W / 2 + (r.x - t.pos.x);
+      const sy = H / 2 + (r.y - t.pos.y);
+
+      ctx.save();
+      ctx.globalAlpha = 0.95;
+      ctx.strokeStyle = t.color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx, sy, r.w, r.h);
+      ctx.restore();
+    }
+  }
+
+  renderPlayer(ctx) {
+    ctx.save();
+
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+
+    ctx.beginPath();
+    ctx.moveTo(W / 2 - 8, H / 2);
+    ctx.lineTo(W / 2 + 8, H / 2);
+    ctx.moveTo(W / 2, H / 2 - 8);
+    ctx.lineTo(W / 2, H / 2 + 8);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  renderDirectionArrows(ctx) {
+    for (const t of this.tunnels) {
+      if (!t.dir) continue;
+
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = t.color;
+      ctx.lineWidth = 2;
+
+      ctx.beginPath();
+      ctx.moveTo(W / 2, H / 2);
+      ctx.lineTo(W / 2 + t.dir.x * 22, H / 2 + t.dir.y * 22);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }
+
+  renderHud(ctx) {
+    this.drawText(ctx, `SCORE: ${this.score}`, 14, 22, 24, '#ffffff', 'left');
+
+    this.drawText(
+      ctx,
+      `T1 [WASD] cells: ${this.tunnels[0].progress}`,
+      14,
+      52,
+      16,
+      this.tunnels[0].color,
+      'left'
+    );
+
+    this.drawText(
+      ctx,
+      `T2 [ARROWS] cells: ${this.tunnels[1].progress}`,
+      14,
+      74,
+      16,
+      this.tunnels[1].color,
+      'left'
+    );
+
+    this.drawText(
+      ctx,
+      `Speed: ${this.runSpeeds[0]}/${this.runSpeeds[1]}`,
+      W - 14,
+      22,
+      14,
+      '#5d7184',
+      'right'
+    );
+
+    this.drawText(
+      ctx,
+      'Esc — пауза',
+      W - 14,
+      44,
+      14,
+      '#5d7184',
+      'right'
+    );
+  }
+
+  renderPlay(ctx) {
+    ctx.fillStyle = '#04060a';
+    ctx.fillRect(0, 0, W, H);
+
+    for (const t of this.tunnels) {
+      this.renderTunnel(ctx, t);
+    }
+
+    this.renderPlayer(ctx);
+    this.renderDirectionArrows(ctx);
+    this.renderHud(ctx);
+  }
+
+  renderPause(ctx) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.58)';
+    ctx.fillRect(0, 0, W, H);
+
+    this.drawText(ctx, 'PAUSE', W / 2, 130, 54, '#ffffff');
+    this.drawText(ctx, `Текущий счёт: ${this.calcScore()}`, W / 2, 190, 24, '#aabbcc');
+
+    const canSaveCurrent = this.currentResultQualifies();
+
+    const labels = {
+      resume: 'Продолжить',
+      restart: 'Начать заново',
+      saveexit: canSaveCurrent ? 'Сохранить рекорд и выйти' : 'Сохранить и выйти (не рекорд)',
+      exit: 'Выйти без сохранения'
+    };
+
+    this.pauseItems.forEach((id, i) => {
+      const selected = i === this.pauseIndex;
+      const enabled = !(id === 'saveexit' && !canSaveCurrent);
+
+      let color = selected ? '#ffffff' : '#8fa3b8';
+      if (!enabled) color = '#445566';
+
+      const prefix = selected ? '> ' : '  ';
+
+      this.drawText(
+        ctx,
+        prefix + labels[id],
+        W / 2,
+        280 + i * 42,
+        selected ? 26 : 22,
+        color
+      );
+    });
+
+    this.drawText(
+      ctx,
+      'Esc — продолжить, Up/Down — выбор, Enter — подтвердить',
+      W / 2,
+      520,
+      16,
+      '#5d7184'
+    );
+
+    this.drawText(
+      ctx,
+      `Формула рекорда: Rating = Score × (0.75×Vmax + 0.25×Vmin) / ${DEFAULT_SPEED}`,
+      W / 2,
+      552,
+      14,
+      '#445566'
+    );
+  }
+
+  renderGameOver(ctx) {
+    this.renderPlay(ctx);
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.68)';
+    ctx.fillRect(0, 0, W, H);
+
+    this.drawText(ctx, 'GAME OVER', W / 2, 150, 58, '#ff5566');
+    this.drawText(ctx, `Score: ${this.finalScore}`, W / 2, 225, 30, '#ffffff');
+
+    if (this.pendingRecord) {
+      this.drawText(
+        ctx,
+        `Record rating: ${this.pendingRecord.rating}`,
+        W / 2,
+        265,
+        24,
+        '#ffd76a'
+      );
+    } else {
+      this.drawText(
+        ctx,
+        'Record rating: 0',
+        W / 2,
+        265,
+        24,
+        '#5d7184'
+      );
+    }
+
+    const canSave = Boolean(this.pendingRecord && this.pendingQualifies);
+
+    const labels = {
+      restart: 'Заново',
+      save: canSave ? 'Сохранить рекорд' : 'Не рекорд',
+      menu: 'В меню'
+    };
+
+    this.gameoverItems.forEach((id, i) => {
+      const selected = i === this.gameoverIndex;
+      const enabled = !(id === 'save' && !canSave);
+
+      let color = selected ? '#ffffff' : '#8fa3b8';
+      if (!enabled) color = '#445566';
+
+      const prefix = selected ? '> ' : '  ';
+
+      this.drawText(
+        ctx,
+        prefix + labels[id],
+        W / 2,
+        340 + i * 42,
+        selected ? 27 : 22,
+        color
+      );
+    });
+
+    this.drawText(
+      ctx,
+      'Up/Down — выбор, Enter — подтвердить',
+      W / 2,
+      520,
+      16,
+      '#5d7184'
+    );
+
+    this.drawText(
+      ctx,
+      `Формула рекорда: Rating = Score × (0.75×Vmax + 0.25×Vmin) / ${DEFAULT_SPEED}`,
+      W / 2,
+      552,
+      14,
+      '#445566'
+    );
+  }
+
+  renderRecords(ctx) {
+    ctx.fillStyle = '#04060a';
+    ctx.fillRect(0, 0, W, H);
+
+    this.drawText(ctx, 'РЕКОРДЫ', W / 2, 80, 48, '#66ddff');
+
+    this.drawText(
+      ctx,
+      `Формула: Rating = Score × (0.75×Vmax + 0.25×Vmin) / ${DEFAULT_SPEED}`,
+      W / 2,
+      122,
+      16,
+      '#ffd76a'
+    );
+
+    if (!this.records.length) {
+      this.drawText(ctx, 'Пока нет сохранённых рекордов', W / 2, 240, 24, '#8fa3b8');
+      this.drawText(ctx, 'Esc / Enter — назад', W / 2, 560, 18, '#5d7184');
+      return;
+    }
+
+    const top = this.records.slice(0, MAX_RECORDS);
+
+    top.forEach((r, i) => {
+      const dateText = r.date
+        ? new Date(r.date).toLocaleDateString()
+        : '';
+
+      const name = String(r.name || 'PLAYER').slice(0, 12).padEnd(12, ' ');
+      const rating = String(r.rating).padStart(6, ' ');
+      const score = String(r.score).padStart(6, ' ');
+      const speed = speedLabelFromRecord(r).padStart(7, ' ');
+
+      const line = `${String(i + 1).padStart(2, ' ')}. ${name}  record:${rating}  score:${score}  speed:${speed}  ${dateText}`;
+
+      this.drawText(
+        ctx,
+        line,
+        70,
+        180 + i * 34,
+        18,
+        i === 0 ? '#ffd76a' : '#9fb4c8',
+        'left'
+      );
+    });
+
+    this.drawText(
+      ctx,
+      'Esc / Enter — назад',
+      W / 2,
+      565,
+      18,
+      '#5d7184'
+    );
+  }
+
+  renderNameEntry(ctx) {
+    ctx.fillStyle = '#04060a';
+    ctx.fillRect(0, 0, W, H);
+
+    if (!this.pendingRecord || !this.pendingQualifies) {
+      this.drawText(ctx, 'Этот результат не является рекордом', W / 2, H / 2, 28, '#ff5566');
+      return;
+    }
+
+    this.drawText(ctx, 'НОВЫЙ РЕКОРД', W / 2, 140, 48, '#66ddff');
+
+    this.drawText(
+      ctx,
+      `Score: ${this.pendingRecord.score}`,
+      W / 2,
+      210,
+      28,
+      '#ffffff'
+    );
+
+    this.drawText(
+      ctx,
+      `Record rating: ${this.pendingRecord.rating}`,
+      W / 2,
+      248,
+      26,
+      '#ffd76a'
+    );
+
+    this.drawText(
+      ctx,
+      `Speed: ${this.pendingRecord.speed1}/${this.pendingRecord.speed2}`,
+      W / 2,
+      284,
+      22,
+      '#8fa3b8'
+    );
+
+    this.drawText(ctx, 'Введите имя:', W / 2, 330, 22, '#8fa3b8');
+
+    const boxW = 460;
+    const boxH = 60;
+    const bx = W / 2 - boxW / 2;
+    const by = 365;
+
+    ctx.save();
+    ctx.strokeStyle = '#66ddff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(bx, by, boxW, boxH);
+    ctx.restore();
+
+    const shownName = this.nameBuffer.length
+      ? this.nameBuffer
+      : '';
+
+    this.drawText(
+      ctx,
+      shownName + '_',
+      W / 2,
+      by + boxH / 2,
+      32,
+      '#ffffff'
+    );
+
+    this.drawText(
+      ctx,
+      'Enter — сохранить, Esc — отмена',
+      W / 2,
+      490,
+      20,
+      '#5d7184'
+    );
+
+    this.drawText(
+      ctx,
+      `Формула рекорда: Rating = Score × (0.75×Vmax + 0.25×Vmin) / ${DEFAULT_SPEED}`,
+      W / 2,
+      530,
+      14,
+      '#445566'
+    );
+  }
+
+  loop(ts) {
+    const dt = Math.min(50, ts - this.last);
+    this.last = ts;
+
+    this.time += dt;
+
+    this.fsm.update(dt);
+    this.fsm.render(this.ctx);
+
+    requestAnimationFrame(this.loop);
+  }
+}
+
+new Game(document.getElementById('game'));
+</script>
+</body>
+</html>
